@@ -75,6 +75,12 @@ use {
 
 pub type PubkeyAccountSlot = (Pubkey, AccountSharedData, Slot);
 
+#[derive(Default)]
+struct EntryAcctLocks {
+    writables: HashSet<Pubkey>,
+    readables: HashSet<Pubkey>,
+}
+
 #[derive(Debug, Default, AbiExample)]
 pub struct AccountLocks {
     write_locks: HashSet<Pubkey>,
@@ -1176,15 +1182,18 @@ impl Accounts {
         account_locks: &mut AccountLocks,
         writable_keys: Vec<&Pubkey>,
         readonly_keys: Vec<&Pubkey>,
+        entry_accts_lookup: &mut EntryAcctLocks,
     ) -> Result<()> {
         for k in writable_keys.iter() {
-            if account_locks.is_locked_write(k) || account_locks.is_locked_readonly(k) {
+            if (account_locks.is_locked_write(k) || account_locks.is_locked_readonly(k))
+                && !entry_accts_lookup.writables.contains(k)
+            {
                 debug!("Writable account in use: {:?}", k);
                 return Err(TransactionError::AccountInUse);
             }
         }
         for k in readonly_keys.iter() {
-            if account_locks.is_locked_write(k) {
+            if account_locks.is_locked_write(k) && !entry_accts_lookup.readables.contains(k) {
                 debug!("Read-only account in use: {:?}", k);
                 return Err(TransactionError::AccountInUse);
             }
@@ -1192,11 +1201,13 @@ impl Accounts {
 
         for k in writable_keys {
             account_locks.write_locks.insert(*k);
+            entry_accts_lookup.writables.insert(*k);
         }
 
         for k in readonly_keys {
             if !account_locks.lock_readonly(k) {
                 account_locks.insert_new_readonly(k);
+                entry_accts_lookup.readables.insert(*k);
             }
         }
 
@@ -1256,6 +1267,7 @@ impl Accounts {
         tx_account_locks_results: Vec<Result<TransactionAccountLocks>>,
     ) -> Vec<Result<()>> {
         let account_locks = &mut self.account_locks.lock().unwrap();
+        let mut entry_accts_lookup = EntryAcctLocks::default();
         tx_account_locks_results
             .into_iter()
             .map(|tx_account_locks_result| match tx_account_locks_result {
@@ -1263,6 +1275,7 @@ impl Accounts {
                     account_locks,
                     tx_account_locks.writable,
                     tx_account_locks.readonly,
+                    &mut entry_accts_lookup,
                 ),
                 Err(err) => Err(err),
             })
