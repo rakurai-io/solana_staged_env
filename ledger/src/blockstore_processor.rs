@@ -25,14 +25,13 @@ use {
             TransactionExecutionDetails, TransactionExecutionResult, TransactionResults,
         },
     },
-    solana_cost_model::cost_model::CostModel,
     solana_entry::entry::{
         self, create_ticks, Entry, EntrySlice, EntryType, EntryVerificationStatus, VerifyRecyclers,
     },
     solana_measure::{measure, measure::Measure},
     solana_metrics::datapoint_error,
     solana_program_runtime::timings::{ExecuteTimingType, ExecuteTimings, ThreadExecuteTimings},
-    solana_rayon_threadlimit::{get_max_thread_count, get_thread_count},
+    solana_rayon_threadlimit::{get_max_thread_count},
     solana_runtime::{
         accounts_background_service::{AbsRequestSender, SnapshotRequestKind},
         bank::{Bank, TransactionBalancesSet},
@@ -46,7 +45,6 @@ use {
     },
     solana_sdk::{
         clock::{Slot, MAX_PROCESSING_AGE},
-        feature_set,
         genesis_config::GenesisConfig,
         hash::Hash,
         pubkey::Pubkey,
@@ -61,7 +59,6 @@ use {
     solana_transaction_status::token_balances::TransactionTokenBalancesSet,
     solana_vote::{vote_account::VoteAccountsHashMap, vote_sender_types::ReplayVoteSender},
     std::{
-        borrow::Cow,
         collections::{HashMap, HashSet},
         path::PathBuf,
         result,
@@ -373,26 +370,6 @@ fn schedule_batches_for_execution(
     }
 }
 
-fn rebatch_transactions<'a>(
-    lock_results: &'a [Result<()>],
-    bank: &'a Arc<Bank>,
-    sanitized_txs: &'a [SanitizedTransaction],
-    start: usize,
-    end: usize,
-    transaction_indexes: &'a [usize],
-) -> TransactionBatchWithIndexes<'a, 'a> {
-    let txs = &sanitized_txs[start..=end];
-    let results = &lock_results[start..=end];
-    let mut tx_batch = TransactionBatch::new(results.to_vec(), bank, Cow::from(txs));
-    tx_batch.set_needs_unlock(false);
-
-    let transaction_indexes = transaction_indexes[start..=end].to_vec();
-    TransactionBatchWithIndexes {
-        batch: tx_batch,
-        transaction_indexes,
-    }
-}
-
 fn rebatch_and_execute_batches(
     bank: &Arc<Bank>,
     batches: &[TransactionBatchWithIndexes],
@@ -406,79 +383,9 @@ fn rebatch_and_execute_batches(
         return Ok(());
     }
 
-    let ((lock_results, sanitized_txs), transaction_indexes): ((Vec<_>, Vec<_>), Vec<_>) = batches
-        .iter()
-        .flat_map(|batch| {
-            batch
-                .batch
-                .lock_results()
-                .iter()
-                .cloned()
-                .zip(batch.batch.sanitized_transactions().to_vec())
-                .zip(batch.transaction_indexes.to_vec())
-        })
-        .unzip();
-
-    let mut minimal_tx_cost = u64::MAX;
-    let mut total_cost: u64 = 0;
-    let tx_costs = sanitized_txs
-        .iter()
-        .map(|tx| {
-            let tx_cost = CostModel::calculate_cost(tx, &bank.feature_set);
-            let cost = tx_cost.sum();
-            minimal_tx_cost = std::cmp::min(minimal_tx_cost, cost);
-            total_cost = total_cost.saturating_add(cost);
-            tx_cost
-        })
-        .collect::<Vec<_>>();
-
-    if bank
-        .feature_set
-        .is_active(&feature_set::apply_cost_tracker_during_replay::id())
-    {
-        let mut cost_tracker = bank.write_cost_tracker().unwrap();
-        for tx_cost in &tx_costs {
-            cost_tracker
-                .try_add(tx_cost)
-                .map_err(TransactionError::from)?;
-        }
-    }
-
-    let target_batch_count = get_thread_count() as u64;
-
-    let mut tx_batches: Vec<TransactionBatchWithIndexes> = vec![];
-    let rebatched_txs = if total_cost > target_batch_count.saturating_mul(minimal_tx_cost) {
-        let target_batch_cost = total_cost / target_batch_count;
-        let mut batch_cost: u64 = 0;
-        let mut slice_start = 0;
-        tx_costs
-            .into_iter()
-            .enumerate()
-            .for_each(|(index, tx_cost)| {
-                let next_index = index + 1;
-                batch_cost = batch_cost.saturating_add(tx_cost.sum());
-                if batch_cost >= target_batch_cost || next_index == sanitized_txs.len() {
-                    let tx_batch = rebatch_transactions(
-                        &lock_results,
-                        bank,
-                        &sanitized_txs,
-                        slice_start,
-                        index,
-                        &transaction_indexes,
-                    );
-                    slice_start = next_index;
-                    tx_batches.push(tx_batch);
-                    batch_cost = 0;
-                }
-            });
-        &tx_batches[..]
-    } else {
-        batches
-    };
-
     let execute_batches_internal_metrics = execute_batches_internal(
         bank,
-        rebatched_txs,
+        batches,
         transaction_status_sender,
         replay_vote_sender,
         log_messages_bytes_limit,
